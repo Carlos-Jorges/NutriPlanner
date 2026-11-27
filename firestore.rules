@@ -1,0 +1,249 @@
+rules_version = '2';
+
+// NutriPlanner security rules.
+// Deploy:  npm run deploy:rules
+// Test:    npm run test:rules   (needs Java, see SETUP_WINDOWS.md)
+//
+// Principles
+// * Default deny. Every path below is listed explicitly.
+// * Roles live in /groups/{groupId}/members/{uid}. The client never decides who is an admin.
+// * Admins: manage fridges, take items out, approve, schedule, manage people and invites.
+// * Members: read everything in their group, add food to fridges, propose meals and
+//   recipes, and use the shopping list.
+// * Joining needs a live invite code. Knowing the code is the permission.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function me() {
+      return request.auth.uid;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function changesOnly(keys) {
+      return incoming().diff(existing()).affectedKeys().hasOnly(keys);
+    }
+
+    function validName(value, max) {
+      return value is string && value.size() > 0 && value.size() <= max;
+    }
+
+    function validQuantity(value) {
+      return value is number && value > 0 && value < 1000000;
+    }
+
+    function validUnit(value) {
+      return value in ['g', 'kg', 'ml', 'l', 'pcs', 'pack'];
+    }
+
+    function memberDoc(groupId) {
+      return /databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid);
+    }
+
+    function isMember(groupId) {
+      return signedIn() && exists(memberDoc(groupId));
+    }
+
+    function isAdmin(groupId) {
+      return isMember(groupId) && get(memberDoc(groupId)).data.role == 'admin';
+    }
+
+    // ── Users: each person reads and writes only their own profile ──────────
+
+    match /users/{userId} {
+      allow read: if signedIn() && me() == userId;
+      allow create: if signedIn() && me() == userId
+        && validName(incoming().displayName, 60)
+        && incoming().groupIds is list;
+      allow update: if signedIn() && me() == userId
+        && changesOnly(['displayName', 'groupIds', 'activeGroupId'])
+        && incoming().groupIds is list;
+      allow delete: if false;
+    }
+
+    // ── Invites: looked up by code, never listed ────────────────────────────
+
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && code.size() == 6
+        && incoming().createdBy == me()
+        && isAdmin(incoming().groupId)
+        && incoming().expiresAt is number
+        && incoming().expiresAt > request.time.toMillis()
+        && incoming().expiresAt < request.time.toMillis() + 30 * 86400000;
+      allow update: if false;
+      // Deleting a code that is already gone is harmless.
+      allow delete: if resource == null || isAdmin(existing().groupId);
+    }
+
+    // ── Groups ──────────────────────────────────────────────────────────────
+
+    match /groups/{groupId} {
+      allow read: if isMember(groupId);
+      // The creator must add themselves as admin in the same batch.
+      allow create: if signedIn()
+        && incoming().createdBy == me()
+        && validName(incoming().name, 60)
+        && getAfter(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)).data.role == 'admin';
+      allow update: if isAdmin(groupId)
+        && changesOnly(['name', 'lunchTime', 'dinnerTime', 'inviteCode', 'inviteExpiresAt'])
+        && validName(incoming().name, 60);
+      allow delete: if false;
+
+      // Members and roles
+      match /members/{memberId} {
+        allow read: if isMember(groupId);
+        allow create: if signedIn()
+          && memberId == me()
+          && incoming().uid == me()
+          && validName(incoming().displayName, 60)
+          && (
+            // Founder: the group document is created in this same batch.
+            (incoming().role == 'admin'
+              && !exists(/databases/$(database)/documents/groups/$(groupId))
+              && getAfter(/databases/$(database)/documents/groups/$(groupId)).data.createdBy == me())
+            ||
+            // Everyone else: a live invite code for this group, joining as a member.
+            (incoming().role == 'member'
+              && incoming().inviteCode is string
+              && incoming().inviteCode.size() == 6
+              && get(/databases/$(database)/documents/invites/$(incoming().inviteCode)).data.groupId == groupId
+              && get(/databases/$(database)/documents/invites/$(incoming().inviteCode)).data.expiresAt > request.time.toMillis())
+          );
+        allow update: if
+          (isAdmin(groupId) && changesOnly(['role']) && incoming().role in ['admin', 'member'])
+          || (signedIn() && memberId == me() && changesOnly(['displayName']) && validName(incoming().displayName, 60));
+        // Admins remove people; anyone can leave.
+        allow delete: if isAdmin(groupId) || (signedIn() && memberId == me());
+      }
+
+      // Fridges and freezers: admins manage them
+      match /fridges/{fridgeId} {
+        allow read: if isMember(groupId);
+        allow create, update: if isAdmin(groupId)
+          && validName(incoming().name, 60)
+          && incoming().kind in ['fridge', 'freezer']
+          && incoming().defaultAlertDays is int
+          && incoming().defaultAlertDays >= 1
+          && incoming().defaultAlertDays <= 730;
+        allow delete: if isAdmin(groupId);
+      }
+
+      // Food in storage
+      function validItem(d) {
+        return validName(d.name, 80)
+          && validQuantity(d.quantity)
+          && validUnit(d.unit)
+          && d.storedAt is number
+          && d.alertAfterDays is int
+          && d.alertAfterDays >= 1
+          && d.alertAfterDays <= 730
+          && d.status in ['stored', 'defrosting']
+          && d.fridgeId is string
+          && exists(/databases/$(database)/documents/groups/$(groupId)/fridges/$(d.fridgeId));
+      }
+
+      match /items/{itemId} {
+        allow read: if isMember(groupId);
+        // Any member can put food away; only admins can create defrosting entries.
+        allow create: if validItem(incoming()) && (
+          isAdmin(groupId)
+          || (isMember(groupId) && incoming().addedBy == me() && incoming().status == 'stored')
+        );
+        // Admins edit and take out. The storage date never changes, so the order stays honest.
+        allow update: if isAdmin(groupId)
+          && validItem(incoming())
+          && incoming().storedAt == existing().storedAt;
+        allow delete: if isAdmin(groupId);
+      }
+
+      // History of what was used or thrown out
+      match /consumptions/{entryId} {
+        allow read: if isMember(groupId);
+        allow create: if isAdmin(groupId)
+          && incoming().consumedBy == me()
+          && incoming().reason in ['used', 'discarded']
+          && validQuantity(incoming().quantity)
+          && validUnit(incoming().unit)
+          && incoming().category in ['fresh', 'frozen'];
+        // Generating the shopping list only marks entries as listed.
+        allow update: if isMember(groupId) && changesOnly(['listed']) && incoming().listed == true;
+        allow delete: if isAdmin(groupId);
+      }
+
+      // Shopping list: everyone in the group can use it
+      function validShopping(d) {
+        return validName(d.name, 80)
+          && validQuantity(d.quantity)
+          && validUnit(d.unit)
+          && d.category in ['fresh', 'frozen']
+          && d.source in ['auto', 'manual']
+          && d.checked is bool;
+      }
+
+      match /shopping/{lineId} {
+        allow read: if isMember(groupId);
+        allow create: if isMember(groupId) && validShopping(incoming()) && incoming().addedBy == me();
+        allow update: if isMember(groupId)
+          && validShopping(incoming())
+          && changesOnly(['checked', 'quantity', 'unit', 'name']);
+        allow delete: if isMember(groupId);
+      }
+
+      // Recipes: members propose, admins approve
+      function validRecipe(d) {
+        return validName(d.name, 80)
+          && d.ingredients is list
+          && d.ingredients.size() >= 1
+          && d.ingredients.size() <= 40
+          && d.defrostHours is int
+          && d.defrostHours >= 0
+          && d.defrostHours <= 72;
+      }
+
+      match /recipes/{recipeId} {
+        allow read: if isMember(groupId);
+        allow create: if isMember(groupId)
+          && validRecipe(incoming())
+          && incoming().proposedBy == me()
+          && (incoming().status == 'pending' || (incoming().status == 'approved' && isAdmin(groupId)));
+        allow update: if isAdmin(groupId)
+          && validRecipe(incoming())
+          && incoming().status in ['pending', 'approved', 'rejected']
+          && incoming().proposedBy == existing().proposedBy;
+        allow delete: if isAdmin(groupId)
+          || (isMember(groupId) && existing().proposedBy == me() && existing().status != 'approved');
+      }
+
+      // Meal calendar: members propose, admins schedule and approve
+      match /meals/{mealId} {
+        allow read: if isMember(groupId);
+        allow create: if isMember(groupId)
+          && incoming().date is string
+          && incoming().date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && incoming().slot in ['lunch', 'dinner']
+          && validName(incoming().title, 80)
+          && incoming().proposedBy == me()
+          && (incoming().status == 'proposed' || (incoming().status == 'confirmed' && isAdmin(groupId)));
+        allow update: if isAdmin(groupId)
+          && incoming().status in ['proposed', 'confirmed', 'rejected']
+          && incoming().proposedBy == existing().proposedBy;
+        allow delete: if isAdmin(groupId)
+          || (isMember(groupId) && existing().proposedBy == me() && existing().status != 'confirmed');
+      }
+    }
+  }
+}
